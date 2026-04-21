@@ -1,0 +1,52 @@
+# ── Core runtime ──────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+httpx==0.27.0
+aiofiles==23.2.1
+pydantic==2.7.1
+
+# ── Config ────────────────────────────────────────────────────
+tomli==2.0.1
+tomli-w==1.0.0
+watchdog==4.0.1
+PyYAML==6.0.1          # FIX: required for settings.yaml + user_prefs.yaml
+
+# ── NLP / parsing ─────────────────────────────────────────────
+spacy==3.7.4
+
+# ── Vector store ──────────────────────────────────────────────
+chromadb==0.5.0
+
+# ── Embeddings ────────────────────────────────────────────────
+sentence-transformers==3.0.1
+
+# ── Web crawler ───────────────────────────────────────────────
+trafilatura==1.9.0
+feedparser==6.0.11
+
+# ── Fine-tuning (optional — install with: pip install -e ".[training]") ──
+# torch>=2.2.0
+# trl==0.9.4
+# transformers==4.42.3
+# datasets==2.19.2
+# peft==0.11.1
+# bitsandbytes==0.43.1
+
+# ── Deduplication ─────────────────────────────────────────────
+datasketch==1.6.4
+
+# ── Voice (optional — install with: pip install -e ".[voice]") ───────────
+# openai-whisper==20231117
+# pyttsx3==2.90
+
+# ── System tray ───────────────────────────────────────────────
+pystray==0.19.5
+Pillow==10.3.0
+
+# ── Storage ───────────────────────────────────────────────────
+sqlalchemy==2.0.30
+
+# ── Utilities ─────────────────────────────────────────────────
+click==8.1.7
+rich==13.7.1
+requests==2.32.3

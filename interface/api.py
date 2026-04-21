@@ -1,0 +1,303 @@
+"""
+interface/api.py — V2.1: true token streaming via SSE + async file I/O.
+"""
+import asyncio
+import json
+import logging
+from pathlib import Path
+from typing import Optional, AsyncGenerator
+
+import aiofiles
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from core.config import config
+from core.event_bus import bus
+from core.orchestrator import Orchestrator
+from core.module_factory import create as factory_create
+
+log = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="OCBrain",
+    version="2.1.0",
+    description="OCBrain API — local self-learning AI assistant",
+)
+
+_orchestrator: Optional[Orchestrator] = None
+_scheduler    = None
+_orchestrator_ref: dict = {}
+
+WEB_DIR = Path(__file__).parent / "web"
+
+
+def setup(orchestrator: Orchestrator, scheduler):
+    global _orchestrator, _scheduler
+    _orchestrator = orchestrator
+    _scheduler    = scheduler
+    _orchestrator_ref["orchestrator"] = orchestrator
+
+    from core.brain_api import register as register_brain_api
+    register_brain_api(app, _orchestrator_ref)
+
+    bus.on("module.promoted",      _log_evt)
+    bus.on("learning.train_done",  _log_evt)
+    bus.on("learning.distill_done",_log_evt)
+
+
+def _log_evt(p): log.info(f"[event] {p.get('_event')}: {p}")
+
+
+# ── Models ────────────────────────────────────────────────────
+
+class QueryRequest(BaseModel):
+    query: str
+    module: Optional[str] = None
+    stream: bool = False
+
+class QueryResponse(BaseModel):
+    answer: str
+    modules_used: list[str] = []
+
+class NewModuleRequest(BaseModel):
+    name: str; desc: str; model: str
+    keywords: list[str]; sources: list[str]
+
+class DistillRequest(BaseModel):
+    module_name: str; topic: str; num_pairs: int = 50
+
+class ExportRequest(BaseModel):
+    module_name: str
+
+class ImportRequest(BaseModel):
+    bundle_path: str; overwrite: bool = False
+
+
+# ── Routes ─────────────────────────────────────────────────────
+
+@app.post("/query")
+async def query(req: QueryRequest):
+    if _orchestrator is None:
+        raise HTTPException(503, "Brain not ready")
+
+    if req.stream:
+        # V2.1: true token streaming
+        return StreamingResponse(
+            _stream_response(_orchestrator, req.query),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control":  "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    answer = await _orchestrator.handle(req.query)
+    return QueryResponse(answer=answer)
+
+
+async def _stream_response(
+    orchestrator: Orchestrator, query: str
+) -> AsyncGenerator[str, None]:
+    """
+    True token streaming: feeds Ollama stream tokens directly to the SSE client.
+    The orchestrator handle() still collects the full answer for context saving,
+    but the client sees tokens as they arrive from the model.
+    """
+    from core.model_router import model_router
+    from core import classifier, decomposer, parser
+
+    # Parse + classify (fast — typically < 10ms)
+    parsed = parser.parse(query)
+    labels = await classifier.label(parsed, orchestrator.context)
+    tasks  = decomposer.build(parsed, labels)
+
+    # For single-module queries: stream tokens directly
+    if len(tasks) == 1:
+        task       = tasks[0]
+        module_name = task.module
+
+        async for token in model_router.stream_route(
+            module_name, task.subtask, orchestrator.context
+        ):
+            yield f"data: {json.dumps({'token': token})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+        # Save to context in background (non-blocking)
+        asyncio.create_task(
+            _save_context_background(orchestrator, query, [module_name])
+        )
+
+    else:
+        # Multi-module: collect all, then stream the merged result in chunks
+        answer = await orchestrator.handle(query)
+        chunk_size = 40
+        for i in range(0, len(answer), chunk_size):
+            yield f"data: {json.dumps({'token': answer[i:i+chunk_size]})}\n\n"
+            await asyncio.sleep(0.008)
+        yield "data: [DONE]\n\n"
+
+
+async def _save_context_background(
+    orchestrator: Orchestrator, query: str, modules: list[str]
+):
+    """Fire-and-forget context save after streaming completes."""
+    try:
+        orchestrator.context.save(query, modules, "")
+    except Exception:
+        pass
+
+
+@app.get("/status")
+async def status():
+    if _orchestrator is None:
+        return {"status": "starting"}
+    from core.brain_version import brain_version_manager
+    return {
+        "status":        "ok",
+        "modules":       _orchestrator.status(),
+        "brain_version": brain_version_manager.brain_version,
+        "app_version":   brain_version_manager.app_version,
+    }
+
+
+@app.get("/modules")
+async def list_modules():
+    if _orchestrator is None:
+        raise HTTPException(503, "Not ready")
+    return {name: mod.health() for name, mod in _orchestrator.modules.items()}
+
+
+@app.post("/modules/new")
+async def new_module(req: NewModuleRequest):
+    try:
+        path = factory_create(req.name, req.desc, req.model, req.keywords, req.sources)
+        from core.module_registry import reload_module
+        reload_module(req.name, _orchestrator.modules)
+        await bus.emit("module.created", {"module": req.name})
+        return {"status": "created", "path": str(path)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/train/{module_name}")
+async def train_module(module_name: str):
+    if _scheduler is None:
+        raise HTTPException(503, "Scheduler not running")
+    if module_name not in _orchestrator.modules:
+        raise HTTPException(404, f"Module '{module_name}' not found")
+    result = await _scheduler.trigger_module(module_name)
+    return {"result": result}
+
+
+@app.post("/distill")
+async def distill(req: DistillRequest):
+    from learning.distiller import distill_topic
+    n = await distill_topic(req.module_name, req.topic, req.num_pairs)
+    return {"status": "done", "pairs_generated": n}
+
+
+@app.post("/export")
+async def export_module(req: ExportRequest):
+    from core.brain_export import export_module
+    path = export_module(req.module_name)
+    return {"status": "exported", "path": str(path)}
+
+
+@app.post("/import")
+async def import_module(req: ImportRequest):
+    from core.brain_export import import_module
+    name = import_module(Path(req.bundle_path), overwrite=req.overwrite)
+    return {"status": "imported", "module": name}
+
+
+@app.get("/config")
+async def get_config():
+    return config._settings
+
+
+@app.put("/config")
+async def set_config(updates: dict):
+    for k, v in updates.items():
+        config.set(k, v)
+    return {"status": "updated"}
+
+
+@app.get("/updates")
+async def check_updates():
+    from interface.updater import check
+    return check().__dict__
+
+
+@app.post("/update/install")
+async def install_update():
+    from interface.updater import check, install
+    info = check()
+    if not info.available:
+        return {"status": "already_up_to_date"}
+    asyncio.create_task(_do_install(info.version))
+    return {"status": "installing", "version": info.version}
+
+
+async def _do_install(v):
+    from interface.updater import install
+    install(v)
+
+
+@app.post("/rollback")
+async def rollback():
+    from interface.updater import rollback as r
+    r()
+    return {"status": "rolled_back"}
+
+
+@app.get("/brain/version")
+async def brain_version():
+    from core.brain_version import brain_version_manager
+    return brain_version_manager.to_dict()
+
+
+@app.get("/events")
+async def event_stream():
+    """SSE stream of all brain events."""
+    async def _gen():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def enqueue(payload):
+            await queue.put(payload)
+
+        from core.event_bus import EVENTS
+        for evt in EVENTS:
+            bus.on(evt, enqueue)
+        try:
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            for evt in EVENTS:
+                bus.off(evt, enqueue)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+# V2.1 FIX: async file I/O for static files
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    index = WEB_DIR / "index.html"
+    if index.exists():
+        async with aiofiles.open(index, "r", encoding="utf-8") as f:
+            content = await f.read()
+        return HTMLResponse(content)
+    return HTMLResponse(
+        "<h2>OCBrain v2.1 is running.</h2>"
+        "<p>API docs: <a href='/docs'>/docs</a></p>"
+    )
+
+
+if WEB_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")

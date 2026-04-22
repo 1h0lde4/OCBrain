@@ -118,13 +118,29 @@ def update():
     """Check for and install available updates."""
     try:
         info = _get("/updates")
+
+        if info.get("check_failed"):
+            console.print(f"[yellow]Could not check for updates: {info.get('check_error')}[/yellow]")
+            return
+
+        current = info.get("current", "?")
         if info.get("available"):
-            console.print(f"[green]Update available: v{info['version']}[/green]")
+            latest = info.get("version", "?")
+            console.print(f"[green]Update available: v{current} → v{latest}[/green]")
+            if info.get("changelog"):
+                console.print(f"[dim]{info['changelog']}[/dim]")
             if click.confirm("Install now?"):
-                _post("/update/install")
-                console.print("[green]Installing... this may take a moment.[/green]")
+                console.print("[yellow]Installing... this runs git pull + pip install.[/yellow]")
+                result = _post("/update/install")
+                console.print(f"[green]{result.get('message', 'Done.')}[/green]")
+                if result.get("status") == "installing":
+                    console.print("[yellow]Restart OCBrain when update completes:[/yellow]")
+                    console.print("  Ctrl+C → python main.py")
         else:
-            console.print("[green]OCBrain is up to date.[/green]")
+            console.print(f"[green]OCBrain v{current} is up to date.[/green]")
+
+    except httpx.ConnectError:
+        console.print("[red]OCBrain is not running. Start it with: source .venv/bin/activate && python main.py[/red]")
     except Exception as e:
         console.print(f"[red]{e}[/red]")
 
@@ -132,10 +148,14 @@ def update():
 @cli.command()
 def rollback():
     """Roll back to the previous version."""
-    if click.confirm("Roll back to previous version?"):
+    if click.confirm("Roll back to the commit before the last update?"):
         try:
-            _post("/rollback")
-            console.print("[green]Rolled back. Please restart OCBrain.[/green]")
+            result = _post("/rollback")
+            if result.get("status") == "ok":
+                console.print(f"[green]{result.get('message')}[/green]")
+                console.print("[yellow]Restart OCBrain:[/yellow]  Ctrl+C → python main.py")
+            else:
+                console.print(f"[red]Rollback failed: {result.get('message')}[/red]")
         except Exception as e:
             console.print(f"[red]{e}[/red]")
 

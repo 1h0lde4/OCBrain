@@ -293,7 +293,11 @@ async function sendQuery() {
     addMessage(d.answer || 'No response.', 'bot', meta);
   } catch (e) {
     hideTyping();
-    addMessage(`Error: ${e.message}`, 'bot');
+    // Show a useful error — HTTP errors have empty .message, so include status
+    const msg = e.message
+      ? `Error: ${e.message}`
+      : `Could not reach OCBrain. Is "python main.py" still running?`;
+    addMessage(msg, 'bot');
   }
   document.getElementById('send-btn').disabled = false;
 }

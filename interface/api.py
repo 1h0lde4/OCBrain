@@ -309,29 +309,61 @@ async def set_config(updates: dict):
 @app.get("/updates")
 async def check_updates():
     from interface.updater import check
-    return check().__dict__
+    result = check()
+    return {
+        "available":    result.available,
+        "version":      result.version,
+        "current":      result.current,
+        "changelog":    result.changelog,
+        "download_url": result.download_url,
+        "check_failed": result.check_failed,
+        "check_error":  result.check_error,
+    }
 
 
 @app.post("/update/install")
 async def install_update():
-    from interface.updater import check, install
+    from interface.updater import check, install_async
     info = check()
+    if info.check_failed:
+        return {"status": "check_failed", "error": info.check_error}
     if not info.available:
-        return {"status": "already_up_to_date"}
-    asyncio.create_task(_do_install(info.version))
-    return {"status": "installing", "version": info.version}
+        return {"status": "already_up_to_date", "version": info.current}
+    # Run non-blocking — git pull can take 30-60s
+    asyncio.create_task(_do_install_async(info.version))
+    return {
+        "status":  "installing",
+        "version": info.version,
+        "message": "Update started in background. Restart OCBrain when complete.",
+    }
 
 
-async def _do_install(v):
-    from interface.updater import install
-    install(v)
+async def _do_install_async(version: str):
+    from interface.updater import install_async
+    import logging
+    result = await install_async(version)
+    logging.getLogger("ocbrain").info(
+        f"[updater] {'OK' if result.success else 'FAILED'}: {result.message}"
+    )
+
+
+@app.post("/update/restart")
+async def restart_server():
+    """Restart OCBrain process to apply a completed update."""
+    from interface.updater import restart
+    asyncio.get_event_loop().call_later(1.0, restart)
+    return {"status": "restarting", "message": "OCBrain will restart in 1 second."}
 
 
 @app.post("/rollback")
 async def rollback():
-    from interface.updater import rollback as r
-    r()
-    return {"status": "rolled_back"}
+    from interface.updater import rollback as do_rollback
+    result = do_rollback()
+    return {
+        "status":           "ok" if result.success else "failed",
+        "message":          result.message,
+        "restart_required": result.restart_required,
+    }
 
 
 @app.get("/brain/version")

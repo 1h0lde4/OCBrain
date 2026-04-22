@@ -105,6 +105,18 @@ async def main():
         sys.exit(1)
     log.info(f"Loaded {len(modules)} module(s): {list(modules.keys())}")
 
+    # Step 4b: Health check each module
+    for name, mod in modules.items():
+        try:
+            h = mod.health()
+            if not h.get("db_ok", True):
+                log.warning(f"  Module '{name}': ChromaDB not OK — queries may fail")
+            else:
+                log.info(f"  Module '{name}': OK (stage={h.get('stage','?')}, "
+                         f"kb_chunks={h.get('kb_chunks',0)})")
+        except Exception as e:
+            log.error(f"  Module '{name}': health check failed — {e}")
+
     # Step 5: Pre-warm Ollama models (V2.1)
     if ollama_ok:
         log.info("Pre-warming Ollama models...")

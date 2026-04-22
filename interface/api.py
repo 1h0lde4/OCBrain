@@ -80,21 +80,38 @@ class ImportRequest(BaseModel):
 @app.post("/query")
 async def query(req: QueryRequest):
     if _orchestrator is None:
-        raise HTTPException(503, "Brain not ready")
-
-    if req.stream:
-        # V2.1: true token streaming
-        return StreamingResponse(
-            _stream_response(_orchestrator, req.query),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control":  "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+        return QueryResponse(
+            answer="OCBrain is still starting up. Please wait a moment and try again."
         )
 
-    answer = await _orchestrator.handle(req.query)
-    return QueryResponse(answer=answer)
+    try:
+        if req.stream:
+            return StreamingResponse(
+                _stream_response(_orchestrator, req.query),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control":     "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        answer = await _orchestrator.handle(req.query)
+        return QueryResponse(answer=answer)
+
+    except Exception as e:
+        import logging, traceback
+        logging.getLogger("ocbrain").error(
+            f"POST /query failed: {e}\n{traceback.format_exc()}"
+        )
+        # Return as answer string — the UI shows it instead of a spinning loader
+        return QueryResponse(
+            answer=(
+                f"OCBrain encountered an error:\n"
+                f"{type(e).__name__}: {e}\n\n"
+                f"Check the terminal running OCBrain (python main.py) "
+                f"for the full error details."
+            )
+        )
 
 
 async def _stream_response(
@@ -211,6 +228,70 @@ async def import_module(req: ImportRequest):
     from core.brain_export import import_module
     name = import_module(Path(req.bundle_path), overwrite=req.overwrite)
     return {"status": "imported", "module": name}
+
+
+@app.get("/debug")
+async def debug():
+    """
+    Returns a full diagnostic snapshot — call this when something is broken.
+    Visit http://localhost:7437/debug in your browser.
+    """
+    import httpx, traceback
+    report = {}
+
+    # Orchestrator
+    report["orchestrator"] = "ready" if _orchestrator else "NOT INITIALISED"
+
+    # Module health
+    if _orchestrator:
+        report["modules"] = {}
+        for name, mod in _orchestrator.modules.items():
+            try:
+                report["modules"][name] = mod.health()
+            except Exception as e:
+                report["modules"][name] = {"error": str(e)}
+
+    # Ollama connectivity
+    host = config.get("global.ollama_host") or "http://localhost:11434"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{host}/api/tags")
+            data = r.json()
+            models = [m.get("name") for m in data.get("models", [])]
+            report["ollama"] = {
+                "status": "reachable",
+                "host": host,
+                "models_available": models,
+            }
+    except Exception as e:
+        report["ollama"] = {
+            "status": "UNREACHABLE",
+            "host": host,
+            "error": str(e),
+            "fix": "Make sure Ollama is running: ollama serve",
+        }
+
+    # Check configured models vs available models
+    if _orchestrator and "models_available" in report.get("ollama", {}):
+        available = report["ollama"]["models_available"]
+        for name, mod_info in report.get("modules", {}).items():
+            bm = mod_info.get("model", "?")
+            # Ollama uses "mistral:latest" for "mistral" etc.
+            found = any(bm in m or m.startswith(bm) for m in available)
+            mod_info["model_available_in_ollama"] = found
+            if not found:
+                mod_info["model_warning"] = (
+                    f"'{bm}' not found in Ollama. "
+                    f"Run: ollama pull {bm}"
+                )
+
+    # Config summary
+    report["config"] = {
+        "ollama_host": config.get("global.ollama_host"),
+        "web_ui_port": config.get("global.web_ui_port"),
+    }
+
+    return report
 
 
 @app.get("/config")
